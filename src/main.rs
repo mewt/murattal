@@ -6,6 +6,7 @@
 //! controllable everywhere.
 
 mod api;
+mod backend;
 mod daemon;
 mod ipc;
 mod surahs;

@@ -13,8 +13,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
-use rodio::{Decoder, OutputStream, OutputStreamHandle, Sink};
-
+use crate::backend::{make_backend, Backend};
 use crate::ipc::{Mode, Request, Response, StatusData, Track};
 use crate::surahs;
 
@@ -80,9 +79,7 @@ enum AudioCmd {
 }
 
 struct AudioState {
-    _stream: OutputStream, // keep the output device alive
-    handle: OutputStreamHandle,
-    sink: Option<Sink>,
+    backend: Box<dyn Backend>,
     tracks: Vec<Track>,
     idx: usize,
     reciter_id: u32,
@@ -90,7 +87,6 @@ struct AudioState {
     mode: Mode,
     playing: bool,
     paused: bool,
-    volume: f32,
     status: Arc<Mutex<StatusData>>,
 }
 
@@ -116,12 +112,10 @@ impl AudioState {
             }
             AudioCmd::TogglePause => {
                 self.paused = !self.paused;
-                if let Some(s) = &self.sink {
-                    if self.paused {
-                        s.pause();
-                    } else {
-                        s.play();
-                    }
+                if self.paused {
+                    self.backend.pause();
+                } else {
+                    self.backend.resume();
                 }
             }
             AudioCmd::Stop => self.stop_playback(),
@@ -137,27 +131,17 @@ impl AudioState {
                     self.load_current();
                 }
             }
-            AudioCmd::Vol(v) => {
-                self.volume = (v as f32 / 100.0).clamp(0.0, 2.0);
-                if let Some(s) = &self.sink {
-                    s.set_volume(self.volume);
-                }
-            }
+            AudioCmd::Vol(v) => self.backend.set_volume(v),
         }
     }
 
     fn stop_playback(&mut self) {
-        if let Some(s) = self.sink.take() {
-            s.stop();
-        }
+        self.backend.stop();
         self.playing = false;
         self.paused = false;
     }
 
     fn load_current(&mut self) {
-        if let Some(old) = self.sink.take() {
-            old.stop();
-        }
         let Some(t) = self.tracks.get(self.idx).cloned() else {
             self.stop_playback();
             return;
@@ -166,23 +150,18 @@ impl AudioState {
         // the (possibly multi-MB) download that follows is still in flight.
         self.write_status();
         match ensure_downloaded(self.reciter_id, &t) {
-            Ok(path) => match File::open(&path).map_err(|e| e.to_string()).and_then(|f| {
-                Decoder::new(BufReader::new(f)).map_err(|e| e.to_string())
-            }) {
-                Ok(dec) => {
-                    if let Ok(sink) = Sink::try_new(&self.handle) {
-                        sink.set_volume(self.volume);
-                        sink.append(dec);
-                        if self.paused {
-                            sink.pause();
-                        }
-                        self.sink = Some(sink);
-                        self.prefetch(self.idx + 1);
-                    }
+            Ok(path) => {
+                self.backend.play_file(&path);
+                if self.paused {
+                    self.backend.pause();
                 }
-                Err(e) => eprintln!("murattal: decode failed for surah {}: {e}", t.surah),
-            },
-            Err(e) => eprintln!("murattal: download failed for surah {}: {e}", t.surah),
+                self.prefetch(self.idx + 1);
+            }
+            Err(e) => {
+                eprintln!("murattal: download failed for surah {}: {e}", t.surah);
+                // Clear the backend so `finished()` is true and tick() skips on.
+                self.backend.stop();
+            }
         }
     }
 
@@ -212,14 +191,8 @@ impl AudioState {
     }
 
     fn tick(&mut self) {
-        if self.playing && !self.paused {
-            let ended = match &self.sink {
-                Some(s) => s.empty(),
-                None => true,
-            };
-            if ended {
-                self.advance();
-            }
+        if self.playing && !self.paused && self.backend.finished() {
+            self.advance();
         }
         self.write_status();
     }
@@ -243,17 +216,8 @@ impl AudioState {
 }
 
 fn audio_thread(rx: mpsc::Receiver<AudioCmd>, status: Arc<Mutex<StatusData>>) {
-    let (stream, handle) = match OutputStream::try_default() {
-        Ok(x) => x,
-        Err(e) => {
-            eprintln!("murattal: no audio output device: {e}");
-            return;
-        }
-    };
     let mut state = AudioState {
-        _stream: stream,
-        handle,
-        sink: None,
+        backend: make_backend(),
         tracks: Vec::new(),
         idx: 0,
         reciter_id: 0,
@@ -261,7 +225,6 @@ fn audio_thread(rx: mpsc::Receiver<AudioCmd>, status: Arc<Mutex<StatusData>>) {
         mode: Mode::Advance,
         playing: false,
         paused: false,
-        volume: 1.0,
         status,
     };
     loop {
