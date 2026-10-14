@@ -7,8 +7,8 @@ description = "Listen to Quran recitation from your terminal — streams full su
 authors = ["Agung Sukariman <agung@smartsalarypro.com>"]
 license = "MIT"
 readme = "README.md"
-repository = "https://github.com/agungsukariman/murattal"
-homepage = "https://github.com/agungsukariman/murattal"
+repository = "https://github.com/mewt/murattal"
+homepage = "https://github.com/mewt/murattal"
 keywords = ["quran", "audio", "recitation", "cli", "player"]
 categories = ["command-line-utilities", "multimedia::audio"]
 
