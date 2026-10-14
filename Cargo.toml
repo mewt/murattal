@@ -1,6 +1,6 @@
 [package]
 name = "murattal"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2021"
 rust-version = "1.74"
 description = "Listen to Quran recitation from your terminal — streams full surahs in the background, no mpv or external player needed."
