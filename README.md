@@ -46,11 +46,23 @@ quran stop
 - **macOS**: works out of the box.
 - **Linux**: needs ALSA at build time — `sudo apt install libasound2-dev`
   (Debian/Ubuntu) or the equivalent.
-- **Android / Termux**: `pkg install rust termux-api`, plus the **Termux:API**
-  app from F-Droid/Play. murattal detects Termux and plays through
+- **Android / Termux**: murattal detects Termux and plays through
   `termux-media-player` (Android's audio) instead of ALSA — so it builds and
   runs on your phone with no NDK. Volume maps to the Android music stream.
   (Pause/resume/stop/skip work; sub-second seeking isn't available there.)
+
+  Setup — **do not use the Play Store** (its Termux is deprecated and broken on
+  Android 11+). Install both the **Termux** app and the **Termux:API** app from
+  **[F-Droid](https://f-droid.org)** (or GitHub releases), from the *same*
+  source so their signatures match, then:
+
+  ```sh
+  pkg install rust termux-api     # termux-api = the CLI bridge package
+  cargo install murattal
+  ```
+
+  `pkg install termux-api` only provides the `termux-media-player` command; it
+  still needs the separately-installed Termux:API **app** to actually play.
 
 ## How it works
 
