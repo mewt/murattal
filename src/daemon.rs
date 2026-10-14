@@ -1,0 +1,345 @@
+//! Background playback daemon: owns the audio output and a control socket.
+//!
+//! One daemon per machine. The client (`quran play`, `quran pause`, …) spawns it
+//! on demand and talks to it over a Unix domain socket, so playback persists in
+//! the background and is controllable from any terminal or session.
+
+use std::fs::{self, File};
+use std::io::{self, BufRead, BufReader, Write};
+use std::os::unix::net::{UnixListener, UnixStream};
+use std::path::PathBuf;
+use std::sync::mpsc::{self, RecvTimeoutError, Sender};
+use std::sync::{Arc, Mutex};
+use std::thread;
+use std::time::Duration;
+
+use rodio::{Decoder, OutputStream, OutputStreamHandle, Sink};
+
+use crate::ipc::{Mode, Request, Response, StatusData, Track};
+use crate::surahs;
+
+const UA: &str = concat!("murattal/", env!("CARGO_PKG_VERSION"));
+
+// ---- shared paths ----------------------------------------------------------
+
+pub fn runtime_dir() -> PathBuf {
+    let d = dirs::cache_dir()
+        .unwrap_or_else(std::env::temp_dir)
+        .join("murattal");
+    let _ = fs::create_dir_all(&d);
+    d
+}
+
+pub fn socket_path() -> PathBuf {
+    runtime_dir().join("daemon.sock")
+}
+
+fn audio_dir(reciter_id: u32) -> PathBuf {
+    let d = runtime_dir().join("audio").join(reciter_id.to_string());
+    let _ = fs::create_dir_all(&d);
+    d
+}
+
+fn track_path(reciter_id: u32, surah: u32) -> PathBuf {
+    audio_dir(reciter_id).join(format!("{surah:03}.mp3"))
+}
+
+/// Download a surah to the cache (if not already there) and return its path.
+fn ensure_downloaded(reciter_id: u32, t: &Track) -> Result<PathBuf, String> {
+    let path = track_path(reciter_id, t.surah);
+    if path.metadata().map(|m| m.len() > 0).unwrap_or(false) {
+        return Ok(path);
+    }
+    let resp = ureq::get(&t.url)
+        .set("User-Agent", UA)
+        .call()
+        .map_err(|e| e.to_string())?;
+    let tmp = path.with_file_name(format!("{:03}.part{}", t.surah, std::process::id()));
+    {
+        let mut f = File::create(&tmp).map_err(|e| e.to_string())?;
+        io::copy(&mut resp.into_reader(), &mut f).map_err(|e| e.to_string())?;
+    }
+    fs::rename(&tmp, &path).map_err(|e| e.to_string())?;
+    Ok(path)
+}
+
+// ---- audio thread ----------------------------------------------------------
+
+enum AudioCmd {
+    Play {
+        tracks: Vec<Track>,
+        reciter_id: u32,
+        reciter_name: String,
+        mode: Mode,
+    },
+    TogglePause,
+    Stop,
+    Next,
+    Prev,
+    Vol(u8),
+}
+
+struct AudioState {
+    _stream: OutputStream, // keep the output device alive
+    handle: OutputStreamHandle,
+    sink: Option<Sink>,
+    tracks: Vec<Track>,
+    idx: usize,
+    reciter_id: u32,
+    reciter_name: String,
+    mode: Mode,
+    playing: bool,
+    paused: bool,
+    volume: f32,
+    status: Arc<Mutex<StatusData>>,
+}
+
+impl AudioState {
+    fn apply(&mut self, cmd: AudioCmd) {
+        match cmd {
+            AudioCmd::Play {
+                tracks,
+                reciter_id,
+                reciter_name,
+                mode,
+            } => {
+                self.tracks = tracks;
+                self.idx = 0;
+                self.reciter_id = reciter_id;
+                self.reciter_name = reciter_name;
+                self.mode = mode;
+                self.playing = !self.tracks.is_empty();
+                self.paused = false;
+                if self.playing {
+                    self.load_current();
+                }
+            }
+            AudioCmd::TogglePause => {
+                self.paused = !self.paused;
+                if let Some(s) = &self.sink {
+                    if self.paused {
+                        s.pause();
+                    } else {
+                        s.play();
+                    }
+                }
+            }
+            AudioCmd::Stop => self.stop_playback(),
+            AudioCmd::Next => {
+                if self.playing && self.idx + 1 < self.tracks.len() {
+                    self.idx += 1;
+                    self.load_current();
+                }
+            }
+            AudioCmd::Prev => {
+                if self.playing && self.idx > 0 {
+                    self.idx -= 1;
+                    self.load_current();
+                }
+            }
+            AudioCmd::Vol(v) => {
+                self.volume = (v as f32 / 100.0).clamp(0.0, 2.0);
+                if let Some(s) = &self.sink {
+                    s.set_volume(self.volume);
+                }
+            }
+        }
+    }
+
+    fn stop_playback(&mut self) {
+        if let Some(s) = self.sink.take() {
+            s.stop();
+        }
+        self.playing = false;
+        self.paused = false;
+    }
+
+    fn load_current(&mut self) {
+        if let Some(old) = self.sink.take() {
+            old.stop();
+        }
+        let Some(t) = self.tracks.get(self.idx).cloned() else {
+            self.stop_playback();
+            return;
+        };
+        // Reflect the target surah right away so `now`/`bar` aren't blank while
+        // the (possibly multi-MB) download that follows is still in flight.
+        self.write_status();
+        match ensure_downloaded(self.reciter_id, &t) {
+            Ok(path) => match File::open(&path).map_err(|e| e.to_string()).and_then(|f| {
+                Decoder::new(BufReader::new(f)).map_err(|e| e.to_string())
+            }) {
+                Ok(dec) => {
+                    if let Ok(sink) = Sink::try_new(&self.handle) {
+                        sink.set_volume(self.volume);
+                        sink.append(dec);
+                        if self.paused {
+                            sink.pause();
+                        }
+                        self.sink = Some(sink);
+                        self.prefetch(self.idx + 1);
+                    }
+                }
+                Err(e) => eprintln!("murattal: decode failed for surah {}: {e}", t.surah),
+            },
+            Err(e) => eprintln!("murattal: download failed for surah {}: {e}", t.surah),
+        }
+    }
+
+    /// Fetch an upcoming track into the cache in the background, so advancing is instant.
+    fn prefetch(&self, idx: usize) {
+        if let Some(t) = self.tracks.get(idx).cloned() {
+            let rid = self.reciter_id;
+            thread::spawn(move || {
+                let _ = ensure_downloaded(rid, &t);
+            });
+        }
+    }
+
+    fn advance(&mut self) {
+        match self.mode {
+            Mode::Loop => self.load_current(),
+            Mode::Once => self.stop_playback(),
+            Mode::Advance => {
+                if self.idx + 1 < self.tracks.len() {
+                    self.idx += 1;
+                    self.load_current();
+                } else {
+                    self.stop_playback();
+                }
+            }
+        }
+    }
+
+    fn tick(&mut self) {
+        if self.playing && !self.paused {
+            let ended = match &self.sink {
+                Some(s) => s.empty(),
+                None => true,
+            };
+            if ended {
+                self.advance();
+            }
+        }
+        self.write_status();
+    }
+
+    fn write_status(&self) {
+        let mut st = self.status.lock().unwrap();
+        if self.playing {
+            if let Some(t) = self.tracks.get(self.idx) {
+                *st = StatusData {
+                    playing: true,
+                    surah: t.surah,
+                    surah_name: surahs::name(t.surah).to_string(),
+                    reciter: self.reciter_name.clone(),
+                    paused: self.paused,
+                };
+                return;
+            }
+        }
+        *st = StatusData::default();
+    }
+}
+
+fn audio_thread(rx: mpsc::Receiver<AudioCmd>, status: Arc<Mutex<StatusData>>) {
+    let (stream, handle) = match OutputStream::try_default() {
+        Ok(x) => x,
+        Err(e) => {
+            eprintln!("murattal: no audio output device: {e}");
+            return;
+        }
+    };
+    let mut state = AudioState {
+        _stream: stream,
+        handle,
+        sink: None,
+        tracks: Vec::new(),
+        idx: 0,
+        reciter_id: 0,
+        reciter_name: String::new(),
+        mode: Mode::Advance,
+        playing: false,
+        paused: false,
+        volume: 1.0,
+        status,
+    };
+    loop {
+        match rx.recv_timeout(Duration::from_millis(200)) {
+            Ok(cmd) => state.apply(cmd),
+            Err(RecvTimeoutError::Timeout) => {}
+            Err(RecvTimeoutError::Disconnected) => break,
+        }
+        state.tick();
+    }
+}
+
+// ---- socket server ---------------------------------------------------------
+
+fn handle_conn(stream: UnixStream, tx: &Sender<AudioCmd>, status: &Arc<Mutex<StatusData>>) {
+    let mut line = String::new();
+    if BufReader::new(&stream).read_line(&mut line).is_err() {
+        return;
+    }
+    let req: Request = match serde_json::from_str(line.trim()) {
+        Ok(r) => r,
+        Err(_) => return,
+    };
+    let resp = match req {
+        Request::Ping => Response::Ok,
+        Request::Status => Response::Status(status.lock().unwrap().clone()),
+        Request::Play {
+            tracks,
+            reciter_id,
+            reciter_name,
+            mode,
+        } => {
+            let _ = tx.send(AudioCmd::Play {
+                tracks,
+                reciter_id,
+                reciter_name,
+                mode,
+            });
+            Response::Ok
+        }
+        Request::TogglePause => send_ok(tx, AudioCmd::TogglePause),
+        Request::Stop => send_ok(tx, AudioCmd::Stop),
+        Request::Next => send_ok(tx, AudioCmd::Next),
+        Request::Prev => send_ok(tx, AudioCmd::Prev),
+        Request::Vol(v) => send_ok(tx, AudioCmd::Vol(v)),
+    };
+    let mut w = &stream;
+    let _ = writeln!(w, "{}", serde_json::to_string(&resp).unwrap());
+}
+
+fn send_ok(tx: &Sender<AudioCmd>, cmd: AudioCmd) -> Response {
+    let _ = tx.send(cmd);
+    Response::Ok
+}
+
+/// Daemon entry point (`quran __daemon`).
+pub fn run() {
+    let sock = socket_path();
+    // Another daemon already listening? Then we are redundant — exit quietly.
+    if UnixStream::connect(&sock).is_ok() {
+        return;
+    }
+    let _ = fs::remove_file(&sock);
+    let listener = match UnixListener::bind(&sock) {
+        Ok(l) => l,
+        Err(_) => return,
+    };
+
+    let status = Arc::new(Mutex::new(StatusData::default()));
+    let (tx, rx) = mpsc::channel::<AudioCmd>();
+    {
+        let status = status.clone();
+        thread::spawn(move || audio_thread(rx, status));
+    }
+
+    for conn in listener.incoming() {
+        if let Ok(stream) = conn {
+            handle_conn(stream, &tx, &status);
+        }
+    }
+}
