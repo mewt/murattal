@@ -78,6 +78,10 @@ enum AudioCmd {
     Vol(u8),
 }
 
+/// Result of an off-thread download: the generation it belongs to and the
+/// local path (or `None` if the download failed).
+type Loaded = (u64, Option<PathBuf>);
+
 struct AudioState {
     backend: Box<dyn Backend>,
     tracks: Vec<Track>,
@@ -87,6 +91,11 @@ struct AudioState {
     mode: Mode,
     playing: bool,
     paused: bool,
+    /// A track is being fetched off-thread; suppress auto-advance until it lands.
+    loading: bool,
+    /// Bumped on every load so a slow download for a surah we've moved past is ignored.
+    gen: u64,
+    ready_tx: Sender<Loaded>,
     status: Arc<Mutex<StatusData>>,
 }
 
@@ -139,29 +148,56 @@ impl AudioState {
         self.backend.stop();
         self.playing = false;
         self.paused = false;
+        self.loading = false;
+        self.gen += 1; // invalidate any download still in flight
     }
 
+    /// Begin loading the current track. The download runs on its own thread so
+    /// the daemon keeps handling commands (switch reciter, stop, skip) instead
+    /// of blocking for the whole of a multi-MB surah like Al-Baqarah.
     fn load_current(&mut self) {
         let Some(t) = self.tracks.get(self.idx).cloned() else {
             self.stop_playback();
             return;
         };
+        self.gen += 1;
+        let gen = self.gen;
+        self.loading = true;
+        // Silence the current track immediately; the next one plays once fetched.
+        self.backend.stop();
         // Reflect the target surah right away so `now`/`bar` aren't blank while
-        // the (possibly multi-MB) download that follows is still in flight.
+        // the download that follows is still in flight.
         self.write_status();
-        match ensure_downloaded(self.reciter_id, &t) {
-            Ok(path) => {
+        let rid = self.reciter_id;
+        let tx = self.ready_tx.clone();
+        thread::spawn(move || {
+            let res = match ensure_downloaded(rid, &t) {
+                Ok(path) => Some(path),
+                Err(e) => {
+                    eprintln!("murattal: download failed for surah {}: {e}", t.surah);
+                    None
+                }
+            };
+            let _ = tx.send((gen, res));
+        });
+        self.prefetch(self.idx + 1);
+    }
+
+    /// Handle a finished off-thread download.
+    fn on_loaded(&mut self, gen: u64, res: Option<PathBuf>) {
+        if gen != self.gen || !self.playing {
+            return; // stale: the user has since switched, skipped, or stopped
+        }
+        self.loading = false;
+        match res {
+            Some(path) => {
                 self.backend.play_file(&path);
                 if self.paused {
                     self.backend.pause();
                 }
-                self.prefetch(self.idx + 1);
             }
-            Err(e) => {
-                eprintln!("murattal: download failed for surah {}: {e}", t.surah);
-                // Clear the backend so `finished()` is true and tick() skips on.
-                self.backend.stop();
-            }
+            // Download failed: skip on to the next track.
+            None => self.advance(),
         }
     }
 
@@ -187,11 +223,21 @@ impl AudioState {
                     self.stop_playback();
                 }
             }
+            Mode::Cycle => {
+                if self.tracks.is_empty() {
+                    self.stop_playback();
+                } else {
+                    self.idx = (self.idx + 1) % self.tracks.len();
+                    self.load_current();
+                }
+            }
         }
     }
 
     fn tick(&mut self) {
-        if self.playing && !self.paused && self.backend.finished() {
+        // Don't auto-advance while a track is still downloading: the backend
+        // reports `finished()` (nothing is playing yet) but we're not done.
+        if self.playing && !self.paused && !self.loading && self.backend.finished() {
             self.advance();
         }
         self.write_status();
@@ -216,6 +262,7 @@ impl AudioState {
 }
 
 fn audio_thread(rx: mpsc::Receiver<AudioCmd>, status: Arc<Mutex<StatusData>>) {
+    let (ready_tx, ready_rx) = mpsc::channel::<Loaded>();
     let mut state = AudioState {
         backend: make_backend(),
         tracks: Vec::new(),
@@ -225,6 +272,9 @@ fn audio_thread(rx: mpsc::Receiver<AudioCmd>, status: Arc<Mutex<StatusData>>) {
         mode: Mode::Advance,
         playing: false,
         paused: false,
+        loading: false,
+        gen: 0,
+        ready_tx,
         status,
     };
     loop {
@@ -232,6 +282,10 @@ fn audio_thread(rx: mpsc::Receiver<AudioCmd>, status: Arc<Mutex<StatusData>>) {
             Ok(cmd) => state.apply(cmd),
             Err(RecvTimeoutError::Timeout) => {}
             Err(RecvTimeoutError::Disconnected) => break,
+        }
+        // Start playing any track whose off-thread download just completed.
+        while let Ok((gen, res)) = ready_rx.try_recv() {
+            state.on_loaded(gen, res);
         }
         state.tick();
     }

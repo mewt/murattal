@@ -1,5 +1,7 @@
 //! Talks to the Quran.com API (which serves QuranicAudio URLs) and resolves reciters.
 
+use std::path::PathBuf;
+
 use crate::ipc::Track;
 
 const UA: &str = concat!("murattal/", env!("CARGO_PKG_VERSION"));
@@ -40,6 +42,42 @@ pub fn resolve_reciter(arg: &str) -> Result<(u32, String), String> {
         .find(|(_, n)| normalize(n).contains(&q))
         .map(|(i, n)| (*i, n.to_string()))
         .ok_or_else(|| format!("no reciter matches '{arg}' (try: quran reciters)"))
+}
+
+// ---- persisted reciter choice ----------------------------------------------
+
+/// Where the "select before play" reciter choice is stored.
+fn reciter_file() -> PathBuf {
+    dirs::cache_dir()
+        .unwrap_or_else(std::env::temp_dir)
+        .join("murattal")
+        .join("reciter")
+}
+
+/// The reciter the user picked with `quran reciter <id|name>`, if any.
+pub fn saved_reciter() -> Option<(u32, String)> {
+    let raw = std::fs::read_to_string(reciter_file()).ok()?;
+    let id: u32 = raw.trim().parse().ok()?;
+    let name = RECITERS
+        .iter()
+        .find(|(i, _)| *i == id)
+        .map(|(_, n)| n.to_string())
+        .unwrap_or_else(|| format!("Reciter #{id}"));
+    Some((id, name))
+}
+
+/// The reciter to use when `--reciter` isn't given: the saved choice, else Hani.
+pub fn default_reciter() -> (u32, String) {
+    saved_reciter().unwrap_or((DEFAULT_RECITER.0, DEFAULT_RECITER.1.to_string()))
+}
+
+/// Persist the user's reciter choice for future plays.
+pub fn save_reciter(id: u32) -> Result<(), String> {
+    let path = reciter_file();
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    std::fs::write(&path, id.to_string()).map_err(|e| e.to_string())
 }
 
 /// Fetch every surah's audio URL for a reciter, sorted 1..=114. Retries transient failures.

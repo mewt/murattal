@@ -11,6 +11,8 @@ cargo install murattal
 
 quran play 27            # An-Naml, then 28, 29, … (auto-advances to 114)
 quran play yasin --once  # just Ya-Sin
+quran juz                # the Juz 'Amma short surahs (Al-Ikhlas … Quraysh)
+quran reciter alafasy    # pick your reciter once; it sticks for future plays
 quran pause              # toggle pause / resume
 quran next               # skip to the next surah
 quran now                # ▶ 27 An-Naml — Hani ar-Rifai
@@ -24,7 +26,9 @@ quran stop
   terminal or session; there's only ever one player (the latest `play` wins).
 - Surahs are cached on first play, so replays are instant and work offline.
 - Auto-advances through the mushaf, or `--once` / `--loop`.
-- Pick a reciter with `--reciter <id|name>` (default: Hani ar-Rifai).
+- `quran juz` plays the ten Juz 'Amma short surahs (great for daily review).
+- Pick a reciter once with `quran reciter <id|name>` — the choice persists for
+  every future play. Override a single play with `--reciter` (default: Hani ar-Rifai).
 - `quran bar` prints a compact one-liner (empty when stopped) for status bars.
 
 ## Commands
@@ -32,6 +36,8 @@ quran stop
 | Command | Description |
 |---|---|
 | `quran play <surah> [--reciter <id\|name>] [--once\|--loop]` | Play a surah (number or name) |
+| `quran juz [--reciter <id\|name>] [--loop]` | Play the Juz 'Amma short surahs, then stop |
+| `quran reciter [<id\|name>]` | Show, or persistently set, the reciter for future plays |
 | `quran pause` | Toggle pause / resume |
 | `quran next` / `quran prev` | Skip within the playlist |
 | `quran now` | What's playing |

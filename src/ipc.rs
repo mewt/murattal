@@ -12,12 +12,14 @@ pub struct Track {
 /// What happens when a surah finishes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Mode {
-    /// Continue to the next surah through 114.
+    /// Advance through the playlist in order, then stop at the end.
     Advance,
     /// Play only the requested surah, then stop.
     Once,
     /// Repeat the requested surah forever.
     Loop,
+    /// Advance through the playlist, wrapping back to the first at the end.
+    Cycle,
 }
 
 /// Command sent from the client to the daemon.

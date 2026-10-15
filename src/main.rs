@@ -36,13 +36,22 @@ enum Cmd {
     Play {
         /// Surah number (1-114) or name, e.g. 27 or "an-naml"
         surah: String,
-        /// Reciter id or name (default: Hani ar-Rifai)
+        /// Reciter id or name for this play (default: your saved reciter, else Hani)
         #[arg(long)]
         reciter: Option<String>,
         /// Play only this surah, then stop
         #[arg(long)]
         once: bool,
         /// Repeat this surah continuously
+        #[arg(long = "loop")]
+        loop_: bool,
+    },
+    /// Play the Juz 'Amma short surahs (Al-Ikhlas … Quraysh), then stop
+    Juz {
+        /// Reciter id or name for this play (default: your saved reciter, else Hani)
+        #[arg(long)]
+        reciter: Option<String>,
+        /// Keep cycling the set instead of stopping at the end
         #[arg(long = "loop")]
         loop_: bool,
     },
@@ -64,6 +73,11 @@ enum Cmd {
     List,
     /// List available reciters
     Reciters,
+    /// Show or set the reciter used by future plays (persists your choice)
+    Reciter {
+        /// Reciter id or name to select; omit to show the current choice
+        who: Option<String>,
+    },
     /// Run the background playback daemon (internal)
     #[command(name = "__daemon", hide = true)]
     Daemon,
@@ -82,6 +96,7 @@ fn main() {
             once,
             loop_,
         } => cmd_play(&surah, reciter.as_deref(), once, loop_),
+        Cmd::Juz { reciter, loop_ } => cmd_juz(reciter.as_deref(), loop_),
         Cmd::Pause => cmd_control(Request::TogglePause),
         Cmd::Next => cmd_control(Request::Next),
         Cmd::Prev => cmd_control(Request::Prev),
@@ -91,6 +106,7 @@ fn main() {
         Cmd::Bar => cmd_bar(),
         Cmd::List => cmd_list(),
         Cmd::Reciters => cmd_reciters(),
+        Cmd::Reciter { who } => cmd_reciter(who.as_deref()),
     };
     std::process::exit(code);
 }
@@ -118,7 +134,7 @@ fn cmd_play(surah_arg: &str, reciter: Option<&str>, once: bool, loop_: bool) -> 
             Ok(x) => x,
             Err(e) => return fail(&e),
         },
-        None => (api::DEFAULT_RECITER.0, api::DEFAULT_RECITER.1.to_string()),
+        None => api::default_reciter(),
     };
 
     eprintln!("Fetching recitation list ({rname})…");
@@ -127,7 +143,8 @@ fn cmd_play(surah_arg: &str, reciter: Option<&str>, once: bool, loop_: bool) -> 
         Err(e) => return fail(&e),
     };
     let tracks: Vec<Track> = match mode {
-        Mode::Advance => all.into_iter().filter(|t| t.surah >= surah).collect(),
+        // `cmd_play` only ever builds Advance/Once/Loop; Cycle comes from `juz`.
+        Mode::Advance | Mode::Cycle => all.into_iter().filter(|t| t.surah >= surah).collect(),
         Mode::Once | Mode::Loop => all.into_iter().filter(|t| t.surah == surah).collect(),
     };
     if tracks.is_empty() {
@@ -150,8 +167,57 @@ fn cmd_play(surah_arg: &str, reciter: Option<&str>, once: bool, loop_: bool) -> 
         Mode::Advance => "auto-advancing to 114",
         Mode::Once => "single surah",
         Mode::Loop => "looping",
+        Mode::Cycle => "cycling",
     };
     println!("▶ Playing {surah} {} — {rname} ({label})", surahs::name(surah));
+    println!("  control: quran pause | next | now | stop");
+    0
+}
+
+fn cmd_juz(reciter: Option<&str>, loop_: bool) -> i32 {
+    let (rid, rname) = match reciter {
+        Some(q) => match api::resolve_reciter(q) {
+            Ok(x) => x,
+            Err(e) => return fail(&e),
+        },
+        None => api::default_reciter(),
+    };
+
+    eprintln!("Fetching recitation list ({rname})…");
+    let all = match api::fetch_playlist(rid) {
+        Ok(v) => v,
+        Err(e) => return fail(&e),
+    };
+    // Build the Juz 'Amma playlist in memorisation order.
+    let tracks: Vec<Track> = surahs::JUZ_AMMA
+        .iter()
+        .filter_map(|s| all.iter().find(|t| t.surah == *s).cloned())
+        .collect();
+    if tracks.is_empty() {
+        return fail("no audio for the Juz 'Amma surahs");
+    }
+
+    let mode = if loop_ { Mode::Cycle } else { Mode::Advance };
+    let first = tracks[0].surah;
+
+    if let Err(e) = ensure_daemon() {
+        return fail(&e);
+    }
+    if let Err(e) = send(&Request::Play {
+        tracks,
+        reciter_id: rid,
+        reciter_name: rname.clone(),
+        mode,
+    }) {
+        return fail(&e);
+    }
+
+    let tail = if loop_ { " (cycling)" } else { ", then stop" };
+    println!(
+        "▶ Juz 'Amma — {} short surahs — {rname}{tail}",
+        surahs::JUZ_AMMA.len()
+    );
+    println!("  starting {first} {}", surahs::name(first));
     println!("  control: quran pause | next | now | stop");
     0
 }
@@ -219,6 +285,39 @@ fn cmd_reciters() -> i32 {
         println!("{id:>3}  {name}");
     }
     0
+}
+
+fn cmd_reciter(who: Option<&str>) -> i32 {
+    match who {
+        // No argument: show the current choice and the available reciters.
+        None => {
+            let (cur_id, _) = api::default_reciter();
+            let saved = api::saved_reciter().is_some();
+            for (id, name) in api::RECITERS {
+                let mark = if *id == cur_id { "➜" } else { " " };
+                println!("{mark} {id:>3}  {name}");
+            }
+            if saved {
+                println!("\nselected: #{cur_id} — set with `quran reciter <id|name>`");
+            } else {
+                println!("\nno reciter selected; using the default (Hani ar-Rifai)");
+            }
+            0
+        }
+        // Argument: resolve and persist the choice for future plays.
+        Some(q) => {
+            let (id, name) = match api::resolve_reciter(q) {
+                Ok(x) => x,
+                Err(e) => return fail(&e),
+            };
+            if let Err(e) = api::save_reciter(id) {
+                return fail(&format!("could not save reciter: {e}"));
+            }
+            println!("✓ reciter set to {name} (#{id})");
+            println!("  the next `quran play` / `quran juz` will use it");
+            0
+        }
+    }
 }
 
 // ---- daemon client ---------------------------------------------------------

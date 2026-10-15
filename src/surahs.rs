@@ -22,6 +22,11 @@ pub const NAMES: [&str; 115] = [
     "Al-Ikhlas", "Al-Falaq", "An-Nas",
 ];
 
+/// Juz 'Amma short surahs, in a common memorisation order (not numeric).
+/// Al-Ikhlas, Al-Falaq, An-Nas, Al-Kawthar, Al-'Asr, An-Nasr, Al-Kafirun,
+/// Al-Masad (Lahab), Al-Ma'un, Quraysh.
+pub const JUZ_AMMA: [u32; 10] = [112, 113, 114, 108, 103, 110, 109, 111, 107, 106];
+
 /// Name for a surah number, or `""` if out of range.
 pub fn name(n: u32) -> &'static str {
     NAMES.get(n as usize).copied().unwrap_or("")
